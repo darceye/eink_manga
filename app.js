@@ -148,20 +148,59 @@ async function parseChapter(url) {
 const HOME = `<!doctype html><html lang=zh><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>墨水屏漫画阅读器</title><style>
-body{font-family:sans-serif;background:#fff;color:#000;display:flex;flex-direction:column;
-align-items:center;justify-content:center;height:100vh;margin:0;gap:1em}
-h1{font-weight:normal;font-size:1.4em}
-form{display:flex;gap:.5em;width:min(90vw,640px)}
-input[type=url]{flex:1;font-size:1em;padding:.6em;border:1px solid #000;border-radius:4px;background:#fff;color:#000}
+body{font-family:sans-serif;background:#fff;color:#000;margin:0;padding:1em;
+display:flex;flex-direction:column;align-items:center;gap:1em;min-height:100vh;box-sizing:border-box}
+h1{font-weight:normal;font-size:1.4em;margin:.5em 0 0}
+form{display:flex;gap:.5em;width:min(92vw,640px)}
+input[type=url]{flex:1;font-size:1em;padding:.6em;border:1px solid #000;border-radius:4px;background:#fff;color:#000;min-width:0}
 button{font-size:1em;padding:.6em 1.2em;border:1px solid #000;border-radius:4px;background:#000;color:#fff;cursor:pointer}
-p{color:#555;font-size:.85em}
+#hist{width:min(92vw,640px)}
+#hist h2{font-size:1em;border-bottom:2px solid #000;padding-bottom:.3em;display:flex;align-items:center;gap:.5em}
+#hist h2 button{font-size:.75em;padding:.2em .7em;background:#fff;color:#000}
+#hist ul{list-style:none;margin:0;padding:0}
+#hist li{border-bottom:1px solid #ddd;padding:.55em 0;display:flex;align-items:baseline;gap:.6em}
+#hist a{color:#000;text-decoration:none;flex:1;min-width:0;font-size:.95em;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#hist a:visited{color:#000}
+#hist .prog{color:#555;font-size:.8em;white-space:nowrap}
+#hist .empty{color:#999;font-size:.9em;padding:.6em 0}
+p.tip{color:#555;font-size:.85em;margin:0;text-align:center}
 </style></head><body>
 <h1>📚 墨水屏漫画阅读器</h1>
 <form action="/read" method="get">
 <input type="url" name="url" placeholder="粘贴漫画章节网址…" required autofocus>
 <button type="submit">阅读</button>
 </form>
-<p>粘贴漫画网站的某一话网址，自动提取图片并以适合墨水屏的翻页方式呈现。</p>
+<div id=hist>
+<h2>历史记录 <button id=clear>清空</button></h2>
+<ul id=list></ul>
+</div>
+<p class=tip>粘贴漫画网站的某一话网址，自动提取图片并以适合墨水屏的翻页方式呈现。</p>
+<script>
+function render(){
+  var h = {};
+  try { h = JSON.parse(localStorage.getItem('eink_hist') || '{}'); } catch(e) {}
+  var arr = Object.keys(h).map(function(k){ return h[k]; })
+    .sort(function(a,b){ return b.t - a.t; });
+  var ul = document.getElementById('list');
+  if (!arr.length) {
+    ul.innerHTML = '<li class=empty>暂无阅读记录</li>';
+    return;
+  }
+  var html = '';
+  for (var j = 0; j < arr.length; j++) {
+    var r = arr[j];
+    var title = (r.title || r.url).replace(/\\s+/g, ' ');
+    html += '<li><a href="/read?url=' + encodeURIComponent(r.url) + '">' + title +
+      '</a><span class=prog>第' + r.page + '/' + r.total + '页</span></li>';
+  }
+  ul.innerHTML = html;
+}
+document.getElementById('clear').onclick = function(){
+  if (confirm('清空全部历史记录?')) { localStorage.removeItem('eink_hist'); render(); }
+};
+render();
+</script>
 </body></html>`;
 
 function errorPage(url) {
@@ -199,10 +238,17 @@ html,body{height:100%;margin:0;overflow:hidden;background:#fff;color:#000;
 #title{flex:1;font-size:.85em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #page{position:fixed;top:0;left:0;right:0;bottom:0;
   display:flex;align-items:center;justify-content:center;overflow:hidden}
-#img{width:100%;height:100%;flex-shrink:0;object-fit:contain;
-  filter:grayscale(1) contrast(1.15)}
+#img{width:100%;height:100%;flex-shrink:0;object-fit:contain}
 #img.rot90{transform:rotate(90deg)}
-#img.inv{filter:grayscale(1) contrast(1.15) invert(1)}
+/* 夜间模式: 页面变黑, 文字/边框变白, 图片不反色 */
+body.night{background:#000}
+body.night #bar,body.night #nav{background:#000;border-color:#fff}
+body.night #bar a,body.night #bar button,
+body.night #bar a:visited{color:#fff;background:#000;border-color:#fff}
+body.night #title,body.night #counter{color:#fff}
+body.night input[type=range]{background:#fff}
+body.night input[type=range]::-webkit-slider-thumb{background:#fff;border-color:#000;box-shadow:0 0 0 1px #fff}
+body.night #load{color:#aaa}
 #zoneL,#zoneR,#zoneM{position:fixed;top:0;bottom:0;width:33.33%;z-index:5}
 #zoneL{left:0;cursor:w-resize}#zoneR{right:0;cursor:e-resize}
 #zoneM{left:33.33%;cursor:pointer}
@@ -304,11 +350,41 @@ function renderInd(){
 function saveCfg(){ localStorage.setItem(KEY_CFG, JSON.stringify(cfg)); }
 function savePos(){ pos[CH_URL] = i; localStorage.setItem(KEY_POS, JSON.stringify(pos)); }
 
+// 系列键: 章节地址最后一段数字替换为 '#', 同一部漫画各章归为一条
+function seriesKey(u){
+  var p = new URL(u);
+  var segs = p.pathname.split('/').filter(Boolean);
+  var seg = segs.pop() || '';
+  var nums = seg.match(/\\d+/g);
+  if (nums) {
+    var last = nums[nums.length - 1];
+    var idx = seg.lastIndexOf(last);
+    seg = seg.slice(0, idx) + '#' + seg.slice(idx + last.length);
+  }
+  return p.origin + '/' + segs.join('/') + '/' + seg;
+}
+function saveHist(){
+  var h = {};
+  try { h = JSON.parse(localStorage.getItem('eink_hist') || '{}'); } catch(e) {}
+  h[seriesKey(CH_URL)] = {
+    url: CH_URL,
+    title: document.title.replace(/\\s+/g, ' ').slice(0, 80),
+    page: i + 1, total: IMGS.length, t: Date.now(),
+  };
+  var ks = Object.keys(h);
+  if (ks.length > 50) { // 超出时删最旧的
+    ks.sort(function(a, b){ return h[a].t - h[b].t; });
+    while (ks.length > 50) delete h[ks.shift()];
+  }
+  localStorage.setItem('eink_hist', JSON.stringify(h));
+}
+
 function applyCfg(){
-  img.className = (cfg.rot ? 'rot90' : '') + (cfg.inv ? ' inv' : '');
+  img.className = cfg.rot ? 'rot90' : '';
   // 旋转 90 度时交换宽高, 保证旋转后仍撑满整屏
   img.style.width = cfg.rot ? '100vh' : '100%';
   img.style.height = cfg.rot ? '100vw' : '100%';
+  document.body.classList.toggle('night', !!cfg.inv);
   invBtn.textContent = cfg.inv ? '白天' : '夜间';
   rotBtn.textContent = cfg.rot ? '竖排' : '旋转';
 }
@@ -317,6 +393,7 @@ function show(){
   slider.value = i + 1;
   counter.textContent = (i + 1) + ' / ' + IMGS.length;
   savePos();
+  saveHist();
   renderInd();
 }
 function go(n){
