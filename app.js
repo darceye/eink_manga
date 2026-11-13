@@ -236,6 +236,7 @@ a.done{visibility:hidden}
   <span id=title>${esc(ch.title)}</span>
   <button id=rotBtn>旋转</button>
   <button id=invBtn>夜间</button>
+  <button id=fsBtn>全屏</button>
 </div>
 
 <div id=page><img id=img alt=""></div>
@@ -337,12 +338,35 @@ bar.onmouseleave = function(){ bar.classList.remove('show'); };
 rotBtn.onclick = function(){ cfg.rot = !cfg.rot; saveCfg(); applyCfg(); };
 invBtn.onclick = function(){ cfg.inv = !cfg.inv; saveCfg(); applyCfg(); };
 
+// 全屏切换 (兼容老 WebKit 内核的墨水屏浏览器)
+var fsBtn = document.getElementById('fsBtn');
+var docEl = document.documentElement;
+function enterFs(el){
+  (el.requestFullscreen || el.webkitRequestFullscreen || function(){ throw 0; }).call(el);
+}
+function exitFs(){
+  (document.exitFullscreen || document.webkitExitFullscreen || function(){}).call(document);
+}
+function isFs(){
+  return !!(document.fullscreenElement || document.webkitFullscreenElement);
+}
+function syncFsBtn(){
+  fsBtn.textContent = isFs() ? '退出全屏' : '全屏';
+}
+fsBtn.onclick = function(){
+  try { isFs() ? exitFs() : enterFs(docEl); } catch(e) {}
+};
+document.addEventListener('fullscreenchange', syncFsBtn);
+document.addEventListener('webkitfullscreenchange', syncFsBtn);
+syncFsBtn();
+
 document.onkeydown = function(e){
   if (e.key === 'ArrowLeft' || e.key === 'PageUp') flip(-1);
   else if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') flip(1);
   else if (e.key === 'Home') go(0);
   else if (e.key === 'End') go(IMGS.length - 1);
   else if (e.key === 'r' || e.key === 'R') rotBtn.click();
+  else if (e.key === 'f' || e.key === 'F') fsBtn.click();
 };
 
 applyCfg(); show();
