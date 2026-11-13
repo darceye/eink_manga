@@ -197,8 +197,9 @@ html,body{height:100%;margin:0;overflow:hidden;background:#fff;color:#000;
 #bar a,#bar button{color:#000;background:#fff;border:1px solid #000;border-radius:4px;
   padding:.25em .6em;font-size:.9em;text-decoration:none;cursor:pointer;line-height:1.4}
 #title{flex:1;font-size:.85em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-#page{position:fixed;top:0;left:0;right:0;bottom:0}
-#img{width:100%;height:100%;object-fit:contain;
+#page{position:fixed;top:0;left:0;right:0;bottom:0;
+  display:flex;align-items:center;justify-content:center;overflow:hidden}
+#img{width:100%;height:100%;flex-shrink:0;object-fit:contain;
   filter:grayscale(1) contrast(1.15)}
 #img.rot90{transform:rotate(90deg)}
 #img.inv{filter:grayscale(1) contrast(1.15) invert(1)}
