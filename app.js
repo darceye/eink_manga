@@ -131,9 +131,161 @@ function extractChapters(html, baseUrl) {
   return { prev, next };
 }
 
+// ---------- dm5.com (动漫屋) 专用解析 ----------
+// 章节页无静态图片: chapterfun.ashx 按签名返回打包 JS, 解包后为
+// pix 基址 + 文件名数组 + '?cid=&key=' 后缀; 每个分页返回 [当前图, 下一页首图(预载)]。
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// Dean Edwards packer 解包 (纯字符串替换, 不执行远端代码)
+function jsUnpack(src) {
+  const m = src.match(/\}\('([\s\S]*)',\s*(\d+)\s*,\s*(\d+)\s*,\s*'([^']*)'\.split\('\|'\)/);
+  if (!m) return src;
+  let p = m[1];
+  const a = parseInt(m[2], 10), c = parseInt(m[3], 10), k = m[4].split('|');
+  p = p.replace(/\\(.)/g, (x, ch) => (ch === 'n' ? '\n' : ch === 't' ? '\t' : ch === 'r' ? '\r' : ch));
+  const e = (n) => (n < a ? '' : e(Math.floor(n / a))) + ((n = n % a) > 35 ? String.fromCharCode(n + 29) : n.toString(36));
+  const d = {};
+  for (let i = c - 1; i >= 0; i--) d[e(i)] = k[i] || e(i);
+  return p.replace(/\b\w+\b/g, w => (w in d ? d[w] : w));
+}
+
+// 从 chapterfun.ashx 响应 (打包或明文) 提取图片 URL 列表; 有高清组 hd_c 时优先
+function dm5ImagesFromCode(code) {
+  if (/eval\(function\(p,a,c,k,e,d\)/.test(code)) code = jsUnpack(code);
+  const baseM = code.match(/var\s+\w+\s*=\s*"(https?:\/\/[^"]+)"/) || code.match(/var\s+\w+\s*=\s*'(https?:\/\/[^']+)'/);
+  const base = baseM ? baseM[1] : '';
+  const suffix = (code.match(/\[\s*\w+\s*\]\s*\+\s*["'](\?[^"']*)["']/) || [])[1] || '';
+  let best = null, hd = null;
+  const arrRe = /(\w+)\s*=\s*\[([^\[\]]*)\]/g;
+  let m;
+  while ((m = arrRe.exec(code))) {
+    const items = [...m[2].matchAll(/["']([^"']+)["']/g)].map(x => x[1]);
+    if (!items.length) continue;
+    const urls = items.map(s => {
+      if (/^https?:\/\//i.test(s)) return s;
+      if (s.startsWith('//')) return 'https:' + s;
+      return base + s + (s.includes('?') ? '' : suffix);
+    });
+    if (m[1] === 'hd_c') hd = urls;
+    else if (m[1] !== 'd_c' && (!best || urls.length > best.length)) best = urls;
+  }
+  return hd || best || [];
+}
+
+function dm5Vars(html) {
+  const vs = {};
+  for (const m of html.matchAll(/var\s+(DM5_[A-Z_]+)\s*=\s*("([^"]*)"|([^;\n]+));/g))
+    vs[m[1]] = m[3] !== undefined ? m[3] : m[4].trim();
+  return vs;
+}
+
+function dm5ApiUrl(chUrl, vs, page, key) {
+  const api = new URL('/chapterfun.ashx', chUrl);
+  api.search = new URLSearchParams({
+    cid: vs.DM5_CID, page: String(page), key,
+    language: '1', gtk: '6',
+    _cid: vs.DM5_CID, _mid: vs.DM5_MID,
+    _dt: vs.DM5_VIEWSIGN_DT, _sign: vs.DM5_VIEWSIGN,
+  }).toString();
+  return api.href;
+}
+
+// 上一章/下一章: 只认明确锚文本/按钮类, 排除章内翻页(-pN)与结尾页(-end)
+function dm5ChapterLinks(html, baseUrl) {
+  let prev = null, next = null;
+  for (const m of html.matchAll(/<a\b([^>]*)href=["']([^"']+)["']([^>]*)>([\s\S]*?)<\/a>/gi)) {
+    const attrs = m[1] + ' ' + m[3];
+    const text = m[4].replace(/<[^>]+>/g, '').trim();
+    let u;
+    try { u = new URL(decodeEnt(m[2].trim()), baseUrl).href; } catch { continue; }
+    let path = '';
+    try { path = new URL(u).pathname; } catch {}
+    if (/(?:-end|-p\d+(?:-pl\d+)?)\/?$/.test(path)) continue;
+    const isPrev = text === '上一章' || /view-btn-prev/.test(attrs);
+    const isNext = text === '下一章' || /view-btn-next/.test(attrs);
+    if (isPrev && !prev) prev = u;
+    else if (isNext && !next) next = u;
+  }
+  return { prev, next };
+}
+
+async function parseDm5Chapter(url, html) {
+  let vs = dm5Vars(html);
+  const count = parseInt(vs.DM5_IMAGE_COUNT, 10);
+  if (!vs.DM5_CID || !count || !vs.DM5_VIEWSIGN) return null;
+  const keyM = html.match(/id="dm5_key"[^>]*value="([^"]*)"/i) || html.match(/value="([^"]*)"[^>]*id="dm5_key"/i);
+  const mk = keyM ? keyM[1] : '';
+  const tm = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  const title = tm ? decodeEnt(tm[1]).replace(/\s+/g, ' ').replace(/_在线漫画阅读.*$/, '').trim() : url;
+
+  // 地址归一化: 去掉 -pN/-plN/-end 后缀, 阅读/进度/历史都挂在章首地址上
+  let canon = url;
+  try {
+    const c = new URL(url);
+    c.search = ''; c.hash = '';
+    c.pathname = c.pathname.replace(/(?:-end|-p\d+(?:-pl\d+)?)\/?$/, '/');
+    if (!c.pathname.endsWith('/')) c.pathname += '/';
+    canon = c.href;
+  } catch {}
+
+  // 并发 3 抓取全部分页; 空页/失败页稍后用新签名补抓
+  const pages = new Array(count).fill(null);
+  const bad = new Set();
+  let cursor = 0;
+  const worker = async () => {
+    while (cursor < count) {
+      const pg = ++cursor;
+      try {
+        const { buf } = await fetchBuf(dm5ApiUrl(canon, vs, pg, mk), canon);
+        const list = dm5ImagesFromCode(buf.toString('utf8').trim());
+        pages[pg - 1] = list;
+        if (!list.length) bad.add(pg);
+      } catch { pages[pg - 1] = []; bad.add(pg); }
+      await sleep(80);
+    }
+  };
+  await Promise.all([worker(), worker(), worker()]);
+
+  if (bad.size) { // 签名有时效: 重新加载章节页换取新签名, 逐页补抓
+    try {
+      const { buf } = await fetchBuf(canon);
+      const vs2 = dm5Vars(buf.toString('utf8'));
+      if (vs2.DM5_VIEWSIGN) vs = vs2;
+    } catch {}
+    for (const pg of [...bad].sort((a, b) => a - b)) {
+      try {
+        const { buf } = await fetchBuf(dm5ApiUrl(canon, vs, pg, mk), canon);
+        const list = dm5ImagesFromCode(buf.toString('utf8').trim());
+        if (list.length) pages[pg - 1] = list;
+      } catch {}
+      await sleep(120);
+    }
+  }
+
+  // 合并去重: 每页数组末尾是下一页首图 (站方预载), 按首次出现顺序保留
+  const seen = new Set();
+  const images = [];
+  for (const list of pages) for (const u of list || [])
+    if (!seen.has(u)) { seen.add(u); images.push(u); }
+
+  return {
+    title, images, url: canon,
+    ...dm5ChapterLinks(html, canon),
+    series: vs.DM5_MID ? 'dm5-' + vs.DM5_MID : undefined,
+  };
+}
+
 async function parseChapter(url) {
   const { buf } = await fetchBuf(url);
   const html = buf.toString('utf8');
+  // dm5.com (动漫屋): 图片由 chapterfun.ashx 动态返回, 走专用解析
+  let host = '';
+  try { host = new URL(url).hostname; } catch {}
+  if (/(^|\.)dm5\.com$/i.test(host) && /var\s+DM5_CID\s*=/.test(html)) {
+    const ch = await parseDm5Chapter(url, html);
+    if (ch && ch.images.length) return ch;
+  }
   const tm = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
   const title = tm ? decodeEnt(tm[1]).replace(/\s+/g, ' ').trim() : url;
   let images = extractImages(html, url);
@@ -298,6 +450,7 @@ a.done{visibility:hidden}
 <script>
 var IMGS = ${imgs};
 var CH_URL = ${JSON.stringify(url)};
+var SERIES = ${JSON.stringify(ch.series || '')};
 var KEY_CFG = 'eink_cfg', KEY_POS = 'eink_pos';
 var cfg = JSON.parse(localStorage.getItem(KEY_CFG) || '{}');
 var pos = JSON.parse(localStorage.getItem(KEY_POS) || '{}');
@@ -366,7 +519,7 @@ function seriesKey(u){
 function saveHist(){
   var h = {};
   try { h = JSON.parse(localStorage.getItem('eink_hist') || '{}'); } catch(e) {}
-  h[seriesKey(CH_URL)] = {
+  h[SERIES || seriesKey(CH_URL)] = {
     url: CH_URL,
     title: document.title.replace(/\\s+/g, ' ').slice(0, 80),
     page: i + 1, total: IMGS.length, t: Date.now(),
@@ -473,7 +626,7 @@ const server = http.createServer(async (req, res) => {
       if (!url) return send(res, 400, '缺少 url 参数', 'text/plain; charset=utf-8');
       const ch = await parseChapter(url);
       if (!ch.images.length) return send(res, 200, errorPage(url));
-      return send(res, 200, readerPage(url, ch));
+      return send(res, 200, readerPage(ch.url || url, ch));
     }
     if (u.pathname === '/img') {
       const target = u.searchParams.get('u') || '';
