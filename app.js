@@ -5,6 +5,7 @@ const http = require('http');
 const net = require('net');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36';
 const IMG_EXT = /\.(jpe?g|png|gif|webp|bmp|avif)(\?|$)/i;
@@ -14,16 +15,120 @@ function decodeEnt(s) {
     .replace(/&quot;/g, '"').replace(/&#0?39;/g, "'");
 }
 
-async function fetchBuf(url, ref) {
+// ---------- Gatekeeper PoW 门禁 (bzmg 系等站点) ----------
+// 首次访问返回 403 {"error":"challenge_required","challenge_url":...}。
+// 挑战页给出 challengeId/ticket/difficultyBits: 浏览器端 worker 求
+// SHA-256("gatekeeper-pow-v1:{challengeId}:{nonce}") 前导零 >= difficultyBits 的 nonce,
+// POST verify 换取放行 Cookie 后重放原请求。这里本地复算等价 PoW (纯哈希, 不执行远端 JS),
+// 按 host 维护 Cookie, 同一 host 的挑战串行避免互相踩 Cookie。
+
+const GK_MAX_BITS = 22; // 难度上限 (防异常值卡死; 实测站点为 12, ~4096 次哈希)
+const gkJars = new Map();  // host -> Map(cookie 名 -> 值)
+const gkLocks = new Map(); // host -> 进行中的挑战 (串行)
+
+function gkJar(host) {
+  if (!gkJars.has(host)) gkJars.set(host, new Map());
+  return gkJars.get(host);
+}
+
+function gkEat(res, host) {
+  let raw = typeof res.headers.getSetCookie === 'function' ? res.headers.getSetCookie() : [];
+  if (!raw.length) {
+    const joined = res.headers.get('set-cookie');
+    if (joined) raw = joined.split(/,(?=[^ ;]+=[^;]*)/); // 老运行时合并头时按 "x=y," 切
+  }
+  const jar = gkJar(host);
+  for (const c of raw) {
+    const pair = c.split(';')[0];
+    const eq = pair.indexOf('=');
+    if (eq > 0) jar.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+  }
+}
+
+function gkLeadingZeroBits(buf) {
+  let n = 0;
+  for (const b of buf) {
+    if (b === 0) { n += 8; continue; }
+    let v = b;
+    while (!(v & 0x80)) { n++; v <<= 1; }
+    break;
+  }
+  return n;
+}
+
+// 从挑战页 HTML 提取配置 (字符串匹配, 不求值页面脚本)
+function gkConfig(html) {
+  const pick = (re) => (html.match(re) || [])[1];
+  const bits = parseInt(pick(/difficultyBits:\s*(\d+)/), 10);
+  const cfg = {
+    challengeId: pick(/challengeId:\s*"([^"]+)"/),
+    ticket: pick(/ticket:\s*"([^"]+)"/),
+    verifyUrl: pick(/verifyUrl:\s*"([^"]+)"/),
+  };
+  return (cfg.challengeId && cfg.ticket && cfg.verifyUrl && bits > 0) ? { ...cfg, bits } : null;
+}
+
+async function gkRaw(url, host, headers, opt) {
+  const cookie = [...gkJar(host)].map(([k, v]) => `${k}=${v}`).join('; ');
   const res = await fetch(url, {
-    headers: {
-      'User-Agent': UA,
-      'Referer': ref || url,
-      'Accept': '*/*',
-      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-    },
+    ...opt,
+    headers: { ...(headers || {}), ...(cookie ? { Cookie: cookie } : {}) },
     redirect: 'follow',
     signal: AbortSignal.timeout(25000),
+  });
+  gkEat(res, host);
+  return res;
+}
+
+async function gkChallenge(startUrl, host, pageUrl) {
+  const doSolve = async () => {
+    const origin = new URL(pageUrl).origin;
+    // 1. 挑战页 (拿 challengeId/ticket/难度; verify 绑定 Referer/Origin)
+    const res = await gkRaw(startUrl, host, {
+      'User-Agent': UA, 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      'Accept': 'text/html,*/*;q=0.8', 'Referer': pageUrl,
+    });
+    const cfg = gkConfig(await res.text());
+    if (!cfg) throw new Error('gatekeeper: 无法解析挑战配置');
+    if (cfg.bits > GK_MAX_BITS) throw new Error(`gatekeeper: 难度 ${cfg.bits} bits 超出上限`);
+    // 2. 本地 PoW
+    const prefix = 'gatekeeper-pow-v1:' + cfg.challengeId + ':';
+    let nonce = 0;
+    while (gkLeadingZeroBits(crypto.createHash('sha256').update(prefix + nonce).digest()) < cfg.bits) nonce++;
+    // 3. 验证换 Cookie
+    const vRes = await gkRaw(new URL(cfg.verifyUrl, pageUrl).href, host, {
+      'User-Agent': UA, 'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+      'Accept': '*/*', 'Content-Type': 'application/json',
+      'Origin': origin, 'Referer': startUrl,
+    }, { method: 'POST', body: JSON.stringify({ challenge_id: cfg.challengeId, ticket: cfg.ticket, nonce: String(nonce) }) });
+    const txt = await vRes.text();
+    if (vRes.status !== 200 || !/"status"\s*:\s*"passed"/.test(txt))
+      throw new Error('gatekeeper 验证失败: HTTP ' + vRes.status + ' ' + txt.slice(0, 80));
+  };
+  const job = (gkLocks.get(host) || Promise.resolve()).then(doSolve, doSolve);
+  gkLocks.set(host, job.catch(() => {}));
+  return job;
+}
+
+// 带 Gatekeeper 重试的请求: 403 且 JSON 要求挑战时, 过关后重放一次
+async function gkFetch(url, headers, opt) {
+  const host = new URL(url).hostname;
+  let res = await gkRaw(url, host, headers, opt);
+  if (res.status !== 403) return res;
+  if (!(res.headers.get('content-type') || '').includes('json')) return res;
+  let j = null;
+  try { j = JSON.parse(await res.text()); } catch {}
+  if (!j || j.error !== 'challenge_required' || !j.challenge_url) return res;
+  await gkChallenge(new URL(j.challenge_url, url).href, host, url);
+  return gkRaw(url, host, headers, opt);
+}
+
+async function fetchBuf(url, ref) {
+  const res = await gkFetch(url, {
+    'User-Agent': UA,
+    'Referer': ref || url,
+    'Accept': '*/*',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
   });
   if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + url);
   return { buf: Buffer.from(await res.arrayBuffer()), ctype: res.headers.get('content-type') || '' };
@@ -33,9 +138,13 @@ async function fetchBuf(url, ref) {
 function shapeOf(u) {
   try {
     const p = new URL(u);
-    let path = p.pathname.replace(/\d+/g, 'N');
-    path = path.replace(/[^/]*\.(jpe?g|png|gif|webp|bmp|avif)$/i, 'F.EXT');
-    return p.host + '|' + path;
+    const segs = p.pathname.split('/');
+    // 文件名含数字 → 归 N 保留形状 (1.jpg / page2.jpg 各自成同形状, 漫画页聚成一组);
+    // 文件名不含数字 → 保留原名, 避免同目录下各异的站点图标 (icon.png / close.png…)
+    // 被并成一组, 在短章节里以数量优势反超真正的漫画图
+    const last = segs[segs.length - 1];
+    segs[segs.length - 1] = /\d/.test(last) ? last.replace(/\d+/g, 'N') : last;
+    return p.host + '|' + segs.join('/').replace(/\d+/g, 'N');
   } catch { return null; }
 }
 
@@ -287,13 +396,21 @@ async function parseChapter(url) {
     if (ch && ch.images.length) return ch;
   }
   const tm = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-  const title = tm ? decodeEnt(tm[1]).replace(/\s+/g, ' ').trim() : url;
+  let title = tm ? decodeEnt(tm[1]).replace(/\s+/g, ' ').trim() : url;
   let images = extractImages(html, url);
   // 动态拼接的图片列表 (JS 循环生成) 优先: 通常数量远大于静态 <img>
   const seq = extractSeqImages(html);
   if (seq.length > images.length) images = seq;
   const { prev, next } = extractChapters(html, url);
-  return { title, images, prev, next };
+  // bzmg 系 (包子漫画 cnbzmg/bzmgcn/baozimh): 标题去站名尾缀; 图片为 <img src> 或
+  // <amp-img data-src> (通用提取已覆盖), 历史按收藏链接里的 comic_id 聚合
+  let series;
+  if (/bzmg|baozimh/i.test(host)) {
+    title = title.replace(/\s*[-–]\s*[^-]{1,16}漫画\s*$/i, '');
+    const idM = html.match(/comic_id=([a-z0-9_-]+)/i);
+    if (idM) series = 'bzmg-' + idM[1];
+  }
+  return { title, images, prev, next, series };
 }
 
 // ---------- 页面模板 ----------
@@ -406,7 +523,9 @@ body.night #load{color:#aaa}
 #zoneM{left:33.33%;cursor:pointer}
 #nav{position:fixed;left:0;right:0;bottom:0;height:var(--bar);
   display:flex;align-items:center;gap:.6em;padding:0 .6em;
-  background:#fff;border-top:2px solid #000;z-index:9}
+  background:#fff;border-top:2px solid #000;z-index:9;
+  transform:translateY(100%);transition:transform .12s}
+#nav.show{transform:translateY(0)}
 #counter{font-size:.9em;min-width:5.5em;text-align:center}
 input[type=range]{flex:1;appearance:none;-webkit-appearance:none;height:4px;
   background:#000;border-radius:2px;outline:none}
@@ -562,8 +681,34 @@ slider.oninput = function(){ go(parseInt(this.value, 10) - 1); };
 
 document.getElementById('zoneL').onclick = function(){ flip(-1); };
 document.getElementById('zoneR').onclick = function(){ flip(1); };
-document.getElementById('zoneM').onclick = function(){ bar.classList.toggle('show'); };
-bar.onmouseleave = function(){ bar.classList.remove('show'); };
+
+// 顶栏/底栏一起呼出隐藏: 点中间切换, 鼠标离开或 BAR_HIDE_MS 无操作自动收起;
+// 按住底栏 (拖动滑动条) 期间挂起不收起, 松手后重新计时
+var nav = document.getElementById('nav');
+var BAR_HIDE_MS = 3000;
+var hideTimer = null, navHold = false;
+function armHide(){
+  if (hideTimer) clearTimeout(hideTimer);
+  hideTimer = setTimeout(function(){
+    hideTimer = null;
+    if (navHold) return armHide();
+    bar.classList.remove('show');
+    nav.classList.remove('show');
+  }, BAR_HIDE_MS);
+}
+function showBar(on){
+  bar.classList.toggle('show', on);
+  nav.classList.toggle('show', on);
+  if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+  if (on) armHide();
+}
+document.getElementById('zoneM').onclick = function(){ showBar(!bar.classList.contains('show')); };
+bar.onmouseleave = function(){ showBar(false); };
+nav.onmouseleave = function(){ showBar(false); };
+nav.onmousedown = nav.ontouchstart = function(){ navHold = true; };
+function navRelease(){ if (!navHold) return; navHold = false; if (nav.classList.contains('show')) armHide(); }
+document.addEventListener('mouseup', navRelease);
+document.addEventListener('touchend', navRelease);
 
 rotBtn.onclick = function(){ cfg.rot = !cfg.rot; saveCfg(); applyCfg(); };
 invBtn.onclick = function(){ cfg.inv = !cfg.inv; saveCfg(); applyCfg(); };

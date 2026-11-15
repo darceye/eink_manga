@@ -14,7 +14,8 @@ node app.js 9000     # 指定起始端口
 ## 功能
 
 ### 解析
-- 自动提取章节页中的漫画图片：优先识别 JS 循环拼接的图片列表（`var pasd="..."; for(i=1;i<=num;i++) pasd+i+'.webp'` 这类动态站点），其次按 URL 形状聚类静态 `<img>`/`data-src`，取最大的一组并按页码排序
+- 自动提取章节页中的漫画图片：优先识别 JS 循环拼接的图片列表（`var pasd="..."; for(i=1;i<=num;i++) pasd+i+'.webp'` 这类动态站点），其次按 URL 形状聚类静态 `<img>`/`<amp-img>`/`data-src`，取最大的一组并按页码排序
+- **Gatekeeper PoW 门禁自动通过**（bzmg 系如 `cn.cnbzmg.com`）：站点首次访问返回 403 挑战，服务端本地复算等价的 SHA-256 前导零工作量证明（纯哈希、不执行远端 JS），换取放行 Cookie 后重放请求；Cookie 按站点缓存复用，过期自动重新挑战；图片地址 `<img src>` 与 `<amp-img data-src>` 均可提取，历史记录按收藏链接中的 `comic_id` 聚合
 - **dm5.com（动漫屋）专用适配**：章节页没有静态图片，服务端用页面内的 `DM5_VIEWSIGN` 签名并发请求 `chapterfun.ashx` 拿到打包 JS，本地解包（Dean Edwards packer，纯字符串替换、不执行远端代码）重建出全部图片 URL；自动跨分页去重、签名过期自动刷新重试；粘贴 `-p2`/`-end` 等子页地址会自动归一到章首；上一章/下一章排除章内翻页与结尾页；历史记录按漫画 ID（`DM5_MID`）聚合
 - 识别"上一章/下一章"链接（匹配 上一章/下一话/prev/next 等关键词及 rel 属性）
 - 图片经本地代理转发（自动携带 Referer 绕过防盗链）
