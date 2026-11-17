@@ -68,16 +68,32 @@ function gkConfig(html) {
   return (cfg.challengeId && cfg.ticket && cfg.verifyUrl && bits > 0) ? { ...cfg, bits } : null;
 }
 
-async function gkRaw(url, host, headers, opt) {
+// 网络请求出口: 连接层偶发错误自动重试。
+// 翻页阅读期间连接闲置, 对端 (CDN/门禁) 常悄悄断开 keep-alive 连接, 复用死连接时
+// undici 抛 "fetch failed" (ECONNRESET/UND_ERR_SOCKET 等) —— 刷新即好的间歇错误多源于此;
+// 重试会丢弃坏连接、新建连接。GET 的 502/503/504 (网关抖动) 同样重试。
+async function gkRaw(url, host, headers, opt, tries = 3) {
   const cookie = [...gkJar(host)].map(([k, v]) => `${k}=${v}`).join('; ');
-  const res = await fetch(url, {
-    ...opt,
-    headers: { ...(headers || {}), ...(cookie ? { Cookie: cookie } : {}) },
-    redirect: 'follow',
-    signal: AbortSignal.timeout(25000),
-  });
-  gkEat(res, host);
-  return res;
+  const isGet = !opt || !opt.method || opt.method === 'GET';
+  let lastErr = null;
+  for (let i = 1; i <= tries; i++) {
+    if (i > 1) await sleep(300 * (i - 1)); // 小退避
+    try {
+      const res = await fetch(url, {
+        ...opt,
+        headers: { ...(headers || {}), ...(cookie ? { Cookie: cookie } : {}) },
+        redirect: 'follow',
+        signal: AbortSignal.timeout(25000),
+      });
+      gkEat(res, host);
+      if (isGet && (res.status === 502 || res.status === 503 || res.status === 504) && i < tries) continue;
+      return res;
+    } catch (e) {
+      lastErr = e;
+      if (i >= tries) throw e;
+    }
+  }
+  throw lastErr;
 }
 
 async function gkChallenge(startUrl, host, pageUrl) {
@@ -110,26 +126,40 @@ async function gkChallenge(startUrl, host, pageUrl) {
   return job;
 }
 
-// 带 Gatekeeper 重试的请求: 403 且 JSON 要求挑战时, 过关后重放一次
+// 带 Gatekeeper 重试的请求: 403 且 JSON 要求挑战时过关后重放; 最多两轮。
+// 挑战某步失败 (如 verify 响应丢失但 Cookie 已发下) 也先重放试探, 仍被拦再挑战一轮
 async function gkFetch(url, headers, opt) {
   const host = new URL(url).hostname;
   let res = await gkRaw(url, host, headers, opt);
-  if (res.status !== 403) return res;
-  if (!(res.headers.get('content-type') || '').includes('json')) return res;
-  let j = null;
-  try { j = JSON.parse(await res.text()); } catch {}
-  if (!j || j.error !== 'challenge_required' || !j.challenge_url) return res;
-  await gkChallenge(new URL(j.challenge_url, url).href, host, url);
-  return gkRaw(url, host, headers, opt);
+  for (let round = 0; round < 2 && res.status === 403; round++) {
+    if (!(res.headers.get('content-type') || '').includes('json')) break;
+    let j = null;
+    try { j = JSON.parse(await res.text()); } catch {}
+    if (!j || j.error !== 'challenge_required' || !j.challenge_url) break;
+    try {
+      await gkChallenge(new URL(j.challenge_url, url).href, host, url);
+    } catch (e) {
+      console.error('gatekeeper 挑战失败 (将试探重放):', e.message);
+    }
+    res = await gkRaw(url, host, headers, opt);
+  }
+  return res;
 }
 
 async function fetchBuf(url, ref) {
-  const res = await gkFetch(url, {
-    'User-Agent': UA,
-    'Referer': ref || url,
-    'Accept': '*/*',
-    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-  });
+  let res;
+  try {
+    res = await gkFetch(url, {
+      'User-Agent': UA,
+      'Referer': ref || url,
+      'Accept': '*/*',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    });
+  } catch (e) {
+    // undici 把真实原因放在 cause (ECONNRESET / UND_ERR_SOCKET / 超时…), 一并带出便于诊断
+    const cause = e && e.cause && (e.cause.code || e.cause.message);
+    throw new Error(((e && e.message) || '请求失败') + (cause ? ' (' + cause + ')' : '') + ' ' + url);
+  }
   if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + url);
   return { buf: Buffer.from(await res.arrayBuffer()), ctype: res.headers.get('content-type') || '' };
 }
@@ -505,6 +535,18 @@ html,body{height:100%;margin:0;overflow:hidden;background:#fff;color:#000;
 #bar a,#bar button{color:#000;background:#fff;border:1px solid #000;border-radius:4px;
   padding:.25em .6em;font-size:.9em;text-decoration:none;cursor:pointer;line-height:1.4}
 #title{flex:1;font-size:.85em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* 图片滤镜面板: 挂在顶栏下方, 随顶栏一起呼出/收起 */
+#fx{position:absolute;top:100%;left:.4em;margin-top:3px;display:none;
+  flex-direction:column;gap:.45em;padding:.55em .7em;min-width:16em;
+  background:#fff;border:2px solid #000;border-radius:4px;font-size:.85em}
+#fx.show{display:flex}
+#fx .row{display:flex;align-items:center;gap:.55em}
+#fx .lbl{flex:none}
+#fx input[type=range]{min-width:0}
+#fx .fval{flex:none;min-width:3.2em;text-align:right}
+#fxReset{align-self:flex-end;font-size:.95em;padding:.15em .8em}
+body.night #fx{background:#000;border-color:#fff}
+body.night #fx .lbl,body.night #fx .fval{color:#fff}
 #page{position:fixed;top:0;left:0;right:0;bottom:0;
   display:flex;align-items:center;justify-content:center;overflow:hidden}
 #img{width:100%;height:100%;flex-shrink:0;object-fit:contain}
@@ -543,6 +585,11 @@ input[type=range]::-moz-range-thumb{width:1.4em;height:1.4em;border-radius:50%;
 #preload .pi-off{color:#bbb}
 #load{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);
   font-size:.9em;color:#555;z-index:1}
+/* 翻页即时反馈: 底部短暂页码提示; 图片未预载好时显示加载中, 到图后转页码 */
+#toast{position:fixed;bottom:calc(var(--bar) + 10px);left:50%;transform:translateX(-50%);
+  background:#fff;color:#000;border:2px solid #000;border-radius:6px;
+  padding:.25em .9em;font-size:.9em;z-index:8;display:none;white-space:nowrap}
+body.night #toast{background:#000;color:#fff;border-color:#fff}
 a.done{visibility:hidden}
 </style></head><body>
 
@@ -554,11 +601,18 @@ a.done{visibility:hidden}
   <button id=rotBtn>旋转</button>
   <button id=invBtn>夜间</button>
   <button id=fsBtn>全屏</button>
+  <button id=fxBtn>滤镜</button>
+  <div id=fx>
+    <div class=row><span class=lbl>亮度</span><input type=range id=briS min=50 max=150 value=100><span class=fval id=briV>100%</span></div>
+    <div class=row><span class=lbl>对比度</span><input type=range id=conS min=50 max=150 value=100><span class=fval id=conV>100%</span></div>
+    <button id=fxReset>重置</button>
+  </div>
 </div>
 
 <div id=page><img id=img alt=""></div>
 <div id=zoneL></div><div id=zoneM></div><div id=zoneR></div>
 <div id=load>加载中…</div>
+<div id=toast></div>
 
 <div id=nav>
   <span id=counter>0 / 0</span>
@@ -583,6 +637,10 @@ var bar = document.getElementById('bar');
 var load = document.getElementById('load');
 var rotBtn = document.getElementById('rotBtn');
 var invBtn = document.getElementById('invBtn');
+var fxBtn = document.getElementById('fxBtn');
+var fx = document.getElementById('fx');
+var briS = document.getElementById('briS'), conS = document.getElementById('conS');
+var briV = document.getElementById('briV'), conV = document.getElementById('conV');
 slider.max = IMGS.length;
 
 // 预加载接下来 3 张, 并在右下角显示各自的加载状态
@@ -668,15 +726,42 @@ function show(){
   saveHist();
   renderInd();
 }
+// 翻页反馈 toast: sticky=true 持续显示 (加载中), 到图后转普通页码提示自动消失
+var toastEl = document.getElementById('toast');
+var toastTimer = null;
+function toast(text, sticky){
+  toastEl.textContent = text;
+  toastEl.style.display = 'block';
+  if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
+  if (!sticky) toastTimer = setTimeout(function(){ toastEl.style.display = 'none'; }, 1200);
+}
+
 function go(n){
   n = Math.max(0, Math.min(IMGS.length - 1, n));
   if (n === i) return;
   i = n; show();
+  if (nav.classList.contains('show')) return; // 底栏可见时页码就在底栏, 不必提示
+  var st = prefetch(i);
+  var num = (i + 1) + ' / ' + IMGS.length;
+  toast(st.state === 'ok' ? num : '加载中 ' + num, st.state !== 'ok');
 }
-function flip(d){ if (i + d >= 0 && i + d < IMGS.length) go(i + d); }
+function flip(d){
+  if (i + d < 0) { toast('已是第一页'); return; }
+  if (i + d >= IMGS.length) { toast('已是最后一页'); return; }
+  go(i + d);
+}
 
-img.onload = function(){ load.style.display = 'none'; };
-img.onerror = function(){ load.style.display = 'block'; load.textContent = '图片加载失败'; };
+img.onload = function(){
+  load.style.display = 'none';
+  // "加载中 n/N" → 到图后转成页码提示, 1.2s 后自动消失
+  if (toastEl.style.display === 'block' && toastEl.textContent.charAt(0) === '加')
+    toast((i + 1) + ' / ' + IMGS.length);
+};
+img.onerror = function(){
+  load.style.display = 'block'; load.textContent = '图片加载失败';
+  toastEl.style.display = 'none';
+  if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
+};
 slider.oninput = function(){ go(parseInt(this.value, 10) - 1); };
 
 document.getElementById('zoneL').onclick = function(){ flip(-1); };
@@ -686,19 +771,21 @@ document.getElementById('zoneR').onclick = function(){ flip(1); };
 // 按住底栏 (拖动滑动条) 期间挂起不收起, 松手后重新计时
 var nav = document.getElementById('nav');
 var BAR_HIDE_MS = 3000;
-var hideTimer = null, navHold = false;
+var hideTimer = null, navHold = false, fxHold = false;
 function armHide(){
   if (hideTimer) clearTimeout(hideTimer);
   hideTimer = setTimeout(function(){
     hideTimer = null;
-    if (navHold) return armHide();
+    if (navHold || fxHold) return armHide();
     bar.classList.remove('show');
     nav.classList.remove('show');
+    fx.classList.remove('show');
   }, BAR_HIDE_MS);
 }
 function showBar(on){
   bar.classList.toggle('show', on);
   nav.classList.toggle('show', on);
+  if (!on) fx.classList.remove('show');
   if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
   if (on) armHide();
 }
@@ -706,12 +793,79 @@ document.getElementById('zoneM').onclick = function(){ showBar(!bar.classList.co
 bar.onmouseleave = function(){ showBar(false); };
 nav.onmouseleave = function(){ showBar(false); };
 nav.onmousedown = nav.ontouchstart = function(){ navHold = true; };
-function navRelease(){ if (!navHold) return; navHold = false; if (nav.classList.contains('show')) armHide(); }
+function navRelease(){
+  var held = navHold || fxHold;
+  navHold = fxHold = false;
+  if (held && nav.classList.contains('show')) armHide();
+}
 document.addEventListener('mouseup', navRelease);
 document.addEventListener('touchend', navRelease);
 
+// 章节切换: 点击后立刻把链接变成"加载中…"并居中提示, 拦截后续重复点击;
+// 若从缓存 (bfcache) 返回本页则恢复原状
+var navBusy = false;
+(function(){
+  var links = bar.getElementsByTagName('a');
+  for (var k = 0; k < links.length; k++) {
+    (function(a){
+      if (!a.getAttribute('href') || a.href.indexOf('/read') < 0) return;
+      a.onclick = function(){
+        if (navBusy) return false;
+        navBusy = true;
+        a.setAttribute('data-txt', a.textContent);
+        a.textContent = '加载中…';
+        load.style.display = 'block';
+        load.textContent = '正在加载新章节…';
+        return true; // 放行本次导航
+      };
+    })(links[k]);
+  }
+})();
+window.addEventListener('pageshow', function(ev){
+  if (!ev.persisted || !navBusy) return;
+  navBusy = false;
+  var links = bar.getElementsByTagName('a');
+  for (var k = 0; k < links.length; k++) {
+    var a = links[k], t = a.getAttribute('data-txt');
+    if (t) { a.textContent = t; a.removeAttribute('data-txt'); }
+  }
+  load.style.display = 'none';
+});
+
 rotBtn.onclick = function(){ cfg.rot = !cfg.rot; saveCfg(); applyCfg(); };
 invBtn.onclick = function(){ cfg.inv = !cfg.inv; saveCfg(); applyCfg(); };
+
+// 图片滤镜: 亮度/对比度 (50–150, 默认 100), CSS filter 实时生效, 全局保存;
+// 非 100 时"滤镜"按钮带 * 标记。老 WebKit 用 -webkit-filter 前缀
+var FX_LO = 50, FX_HI = 150;
+function fxClamp(v){
+  v = parseInt(v, 10);
+  if (isNaN(v)) v = 100;
+  return Math.max(FX_LO, Math.min(FX_HI, v));
+}
+function applyFx(){
+  var b = fxClamp(cfg.bri), c = fxClamp(cfg.con);
+  cfg.bri = b; cfg.con = c;
+  var f = 'brightness(' + b + '%) contrast(' + c + '%)';
+  img.style.webkitFilter = f;
+  img.style.filter = f;
+  briS.value = b; conS.value = c;
+  briV.textContent = b + '%';
+  conV.textContent = c + '%';
+  fxBtn.textContent = (b === 100 && c === 100) ? '滤镜' : '滤镜*';
+}
+fxBtn.onclick = function(){
+  var on = !fx.classList.contains('show');
+  fx.classList.toggle('show', on);
+  if (on) showBar(true); // 打开面板时确保顶栏可见并重新计时
+};
+briS.oninput = function(){ cfg.bri = fxClamp(this.value); applyFx(); saveCfg(); };
+conS.oninput = function(){ cfg.con = fxClamp(this.value); applyFx(); saveCfg(); };
+document.getElementById('fxReset').onclick = function(){
+  cfg.bri = 100; cfg.con = 100; applyFx(); saveCfg();
+};
+// 面板内拖动滑杆期间挂起工具栏自动收起 (与底栏滑动条一致)
+fx.onmousedown = fx.ontouchstart = function(){ fxHold = true; };
 
 // 全屏切换 (兼容老 WebKit 内核的墨水屏浏览器)
 var fsBtn = document.getElementById('fsBtn');
@@ -744,7 +898,7 @@ document.onkeydown = function(e){
   else if (e.key === 'f' || e.key === 'F') fsBtn.click();
 };
 
-applyCfg(); show();
+applyCfg(); applyFx(); show();
 </script>
 </body></html>`;
 }
