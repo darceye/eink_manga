@@ -530,20 +530,20 @@ html,body{height:100%;margin:0;overflow:hidden;background:#fff;color:#000;
 #bar{position:fixed;top:0;left:0;right:0;height:var(--bar);
   display:flex;align-items:center;gap:.4em;padding:0 .5em;
   background:#fff;border-bottom:2px solid #000;z-index:9;
-  transform:translateY(-100%);transition:transform .12s}
+  transform:translateY(-100%)}
 #bar.show{transform:translateY(0)}
 #bar a,#bar button{color:#000;background:#fff;border:1px solid #000;border-radius:4px;
   padding:.25em .6em;font-size:.9em;text-decoration:none;cursor:pointer;line-height:1.4}
 #title{flex:1;font-size:.85em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-/* 图片滤镜面板: 挂在顶栏下方, 随顶栏一起呼出/收起 */
-#fx{position:absolute;top:100%;left:.4em;margin-top:3px;display:none;
-  flex-direction:column;gap:.45em;padding:.55em .7em;min-width:16em;
-  background:#fff;border:2px solid #000;border-radius:4px;font-size:.85em}
+/* 图片滤镜面板: 与屏幕同宽挂在顶栏下方, 滑杆更长调节更细 */
+#fx{position:absolute;top:100%;left:0;right:0;margin-top:3px;display:none;
+  flex-direction:column;gap:.45em;padding:.55em .8em;
+  background:#fff;border-top:2px solid #000;border-bottom:2px solid #000;font-size:.85em}
 #fx.show{display:flex}
 #fx .row{display:flex;align-items:center;gap:.55em}
-#fx .lbl{flex:none}
-#fx input[type=range]{min-width:0}
-#fx .fval{flex:none;min-width:3.2em;text-align:right}
+#fx .lbl{flex:none;min-width:3.6em}
+#fx input[type=range]{flex:1;min-width:0}
+#fx .fval{flex:none;min-width:3.4em;text-align:right}
 #fxReset{align-self:flex-end;font-size:.95em;padding:.15em .8em}
 body.night #fx{background:#000;border-color:#fff}
 body.night #fx .lbl,body.night #fx .fval{color:#fff}
@@ -566,7 +566,7 @@ body.night #load{color:#aaa}
 #nav{position:fixed;left:0;right:0;bottom:0;height:var(--bar);
   display:flex;align-items:center;gap:.6em;padding:0 .6em;
   background:#fff;border-top:2px solid #000;z-index:9;
-  transform:translateY(100%);transition:transform .12s}
+  transform:translateY(100%)}
 #nav.show{transform:translateY(0)}
 #counter{font-size:.9em;min-width:5.5em;text-align:center}
 input[type=range]{flex:1;appearance:none;-webkit-appearance:none;height:4px;
@@ -603,8 +603,8 @@ a.done{visibility:hidden}
   <button id=fsBtn>全屏</button>
   <button id=fxBtn>滤镜</button>
   <div id=fx>
-    <div class=row><span class=lbl>亮度</span><input type=range id=briS min=50 max=150 value=100><span class=fval id=briV>100%</span></div>
-    <div class=row><span class=lbl>对比度</span><input type=range id=conS min=50 max=150 value=100><span class=fval id=conV>100%</span></div>
+    <div class=row><span class=lbl>亮度</span><input type=range id=briS min=0 max=300 value=100><span class=fval id=briV>100%</span></div>
+    <div class=row><span class=lbl>对比度</span><input type=range id=conS min=0 max=300 value=100><span class=fval id=conV>100%</span></div>
     <button id=fxReset>重置</button>
   </div>
 </div>
@@ -767,39 +767,14 @@ slider.oninput = function(){ go(parseInt(this.value, 10) - 1); };
 document.getElementById('zoneL').onclick = function(){ flip(-1); };
 document.getElementById('zoneR').onclick = function(){ flip(1); };
 
-// 顶栏/底栏一起呼出隐藏: 点中间切换, 鼠标离开或 BAR_HIDE_MS 无操作自动收起;
-// 按住底栏 (拖动滑动条) 期间挂起不收起, 松手后重新计时
+// 顶栏/底栏一起呼出隐藏: 只由点中间区域切换, 不自动收起 (墨水屏刷新慢, 由用户显式控制)
 var nav = document.getElementById('nav');
-var BAR_HIDE_MS = 3000;
-var hideTimer = null, navHold = false, fxHold = false;
-function armHide(){
-  if (hideTimer) clearTimeout(hideTimer);
-  hideTimer = setTimeout(function(){
-    hideTimer = null;
-    if (navHold || fxHold) return armHide();
-    bar.classList.remove('show');
-    nav.classList.remove('show');
-    fx.classList.remove('show');
-  }, BAR_HIDE_MS);
-}
 function showBar(on){
   bar.classList.toggle('show', on);
   nav.classList.toggle('show', on);
   if (!on) fx.classList.remove('show');
-  if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
-  if (on) armHide();
 }
 document.getElementById('zoneM').onclick = function(){ showBar(!bar.classList.contains('show')); };
-bar.onmouseleave = function(){ showBar(false); };
-nav.onmouseleave = function(){ showBar(false); };
-nav.onmousedown = nav.ontouchstart = function(){ navHold = true; };
-function navRelease(){
-  var held = navHold || fxHold;
-  navHold = fxHold = false;
-  if (held && nav.classList.contains('show')) armHide();
-}
-document.addEventListener('mouseup', navRelease);
-document.addEventListener('touchend', navRelease);
 
 // 章节切换: 点击后立刻把链接变成"加载中…"并居中提示, 拦截后续重复点击;
 // 若从缓存 (bfcache) 返回本页则恢复原状
@@ -835,9 +810,9 @@ window.addEventListener('pageshow', function(ev){
 rotBtn.onclick = function(){ cfg.rot = !cfg.rot; saveCfg(); applyCfg(); };
 invBtn.onclick = function(){ cfg.inv = !cfg.inv; saveCfg(); applyCfg(); };
 
-// 图片滤镜: 亮度/对比度 (50–150, 默认 100), CSS filter 实时生效, 全局保存;
+// 图片滤镜: 亮度/对比度 (0–300, 默认 100), CSS filter 实时生效, 全局保存;
 // 非 100 时"滤镜"按钮带 * 标记。老 WebKit 用 -webkit-filter 前缀
-var FX_LO = 50, FX_HI = 150;
+var FX_LO = 0, FX_HI = 300;
 function fxClamp(v){
   v = parseInt(v, 10);
   if (isNaN(v)) v = 100;
@@ -857,15 +832,13 @@ function applyFx(){
 fxBtn.onclick = function(){
   var on = !fx.classList.contains('show');
   fx.classList.toggle('show', on);
-  if (on) showBar(true); // 打开面板时确保顶栏可见并重新计时
+  if (on) showBar(true); // 打开面板时确保顶栏可见
 };
 briS.oninput = function(){ cfg.bri = fxClamp(this.value); applyFx(); saveCfg(); };
 conS.oninput = function(){ cfg.con = fxClamp(this.value); applyFx(); saveCfg(); };
 document.getElementById('fxReset').onclick = function(){
   cfg.bri = 100; cfg.con = 100; applyFx(); saveCfg();
 };
-// 面板内拖动滑杆期间挂起工具栏自动收起 (与底栏滑动条一致)
-fx.onmousedown = fx.ontouchstart = function(){ fxHold = true; };
 
 // 全屏切换 (兼容老 WebKit 内核的墨水屏浏览器)
 var fsBtn = document.getElementById('fsBtn');
